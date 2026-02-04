@@ -771,6 +771,14 @@ def enable_autowrap():
     sys.stdout.write("\033[?7h")
     sys.stdout.flush()
 
+def enter_alt_screen():
+    sys.stdout.write("\033[?1049h\033[H\033[2J")
+    sys.stdout.flush()
+
+def exit_alt_screen():
+    sys.stdout.write("\033[?1049l")
+    sys.stdout.flush()
+
 def get_mute_volume():
     return SOFT_MUTE_VOL if MUTE_MODE == "soft" else 0
 
@@ -1296,9 +1304,9 @@ def main():
         stop_cava()
         stop_mpv()
         teardown_private_sink(private_module, loopback_module)
+        enable_autowrap()
         show_cursor()
-        sys.stdout.write("[2J[H")
-        sys.stdout.flush()
+        exit_alt_screen()
         sys.exit(0)
 
     def get_playback():
@@ -1346,6 +1354,7 @@ def main():
 
     start_cava()
 
+    enter_alt_screen()
     hide_cursor()
     disable_autowrap()
     try:
@@ -1397,11 +1406,14 @@ def main():
                 # Responsive layout for small terminals
                 tiny_term = layout_mode == "tiny"
                 small_term = layout_mode in ("tiny", "small")
-                ultra_compact = term_cols < 70 or term_rows < 18
+                # Prioritize time + visualizer in very short terminals (height-driven)
+                ultra_compact = term_rows < 10
                 # Keep box borders under terminal width to prevent auto-wrap
                 info_max_width = max(10, term_cols - 5)
                 spectrum_use_color = USE_COLOR
-                spectrum_height = 3 if ultra_compact else 4 if tiny_term else 6 if small_term else CAVA_HEIGHT
+                min_spectrum_rows = 6
+                base_spectrum = 3 if ultra_compact else 4 if tiny_term else 6 if small_term else CAVA_HEIGHT
+                spectrum_height = max(min_spectrum_rows, base_spectrum)
 
                 hour_changed = (last_hour is not None and hour != last_hour)
                 needs_start = (last_hour is None or mpv_proc is None or (mpv_proc and mpv_proc.poll() is not None))
@@ -1436,26 +1448,33 @@ def main():
                     info.append(c(text, color_code))
 
                 tline = f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-                if ultra_compact:
-                    # Smallest layout: only show system time + visualizer
-                    lines.append(c(tline, "2"))
-                if (not ultra_compact) and TITLE_ART:
-                    if TITLE_ART_COLORED:
-                        info.extend([line for line in TITLE_ART])
-                        info_plain.extend([strip_ansi(line) for line in TITLE_ART])
-                    else:
-                        info.extend([c(line, "38;5;77") for line in TITLE_ART])
-                        info_plain.extend([line for line in TITLE_ART])
-                    controls_plain = "Controls: [n] next track   [q] quit   [s] audio output   [?] help / more controls   [+/-] volume"
-                    if tiny_term:
-                        controls_plain = "Keys: n next  q quit  s audio output  ? help / more  +/- vol"
-                    # Wrap controls to fit the terminal width so the info box doesn't overflow
-                    max_controls_width = max(20, term_cols - 6)
-                    controls_wrapped = wrap_plain(controls_plain, max_controls_width)
-                    for line in controls_wrapped:
-                        add_info_line(line, "33")
-                    add_info_line("", "2")
-                    add_info_line(tline, "2")
+                # Always show system time at top
+                lines.append(c(tline, "2"))
+
+                # Reserve rows for the visualizer when possible
+                max_info_rows = term_rows - min_spectrum_rows - 1 - 1 - 2  # divider + time + box borders
+                compact_info = max_info_rows < 10 or term_cols < 70 or ultra_compact
+
+                if not ultra_compact:
+                    if (not compact_info) and TITLE_ART:
+                        if TITLE_ART_COLORED:
+                            info.extend([line for line in TITLE_ART])
+                            info_plain.extend([strip_ansi(line) for line in TITLE_ART])
+                        else:
+                            info.extend([c(line, "38;5;77") for line in TITLE_ART])
+                            info_plain.extend([line for line in TITLE_ART])
+
+                    if not compact_info:
+                        controls_plain = "Controls: [n] next track   [q] quit   [s] audio output   [?] help / more controls   [+/-] volume"
+                        if tiny_term:
+                            controls_plain = "Keys: n next  q quit  s audio output  ? help / more  +/- vol"
+                        # Wrap controls to fit the terminal width so the info box doesn't overflow
+                        max_controls_width = max(20, term_cols - 6)
+                        controls_wrapped = wrap_plain(controls_plain, max_controls_width)
+                        for line in controls_wrapped:
+                            add_info_line(line, "33")
+                        add_info_line("", "2")
+
                     fline = f"Filter: Game={games_list[game_idx]}  Variant={variants_list[variant_idx]}"
                     add_info_line(fline, "2")
                     vline = f"Visualizer: {VIS_MODES[vis_idx]}"
@@ -1467,18 +1486,21 @@ def main():
                         display_hour = current_track_hour if current_track_hour is not None else hour
                         line1_plain = f"Hour folder: {display_hour:02d}    Now playing: {os.path.basename(current_track)}"
                         add_info_line(line1_plain, "36")
-                        line2_plain = f"Playback: {fmt_mmss(tpos or -1)} / {fmt_mmss(dur or -1)}"
-                        add_info_line(line2_plain, "35")
+                        if not compact_info:
+                            line2_plain = f"Playback: {fmt_mmss(tpos or -1)} / {fmt_mmss(dur or -1)}"
+                            add_info_line(line2_plain, "35")
                         display_vol = output_vol if (PRIVATE_SINK and loopback_module) else (int(vol) if vol is not None else None)
-                        if display_vol is not None:
+                        if (display_vol is not None) and (not compact_info):
                             vline = f"Volume: {int(display_vol):3d}%"
                             add_info_line(vline, "33")
-                        mline = f"Mute: {'ON' if muted else 'OFF'}"
-                        add_info_line(mline, "33")
+                        if not compact_info:
+                            mline = f"Mute: {'ON' if muted else 'OFF'}"
+                            add_info_line(mline, "33")
                     else:
                         line1_plain = f"Hour folder: {hour:02d}    Now playing: (none found)"
                         add_info_line(line1_plain, "36")
-                    add_info_line("", "2")
+                    if not compact_info:
+                        add_info_line("", "2")
                     ulabel = "Until next hour:"
                     uvalue = f"{remaining//60:02d}:{remaining%60:02d}"
                     uline = f"{ulabel} {uvalue}"
@@ -1496,13 +1518,24 @@ def main():
 
                 if not ultra_compact:
                     # Box the info section (width based on plain text)
-                    info_w_needed = max([len(line) for line in info_plain] + [0])
-                    info_w_cache = min(info_max_width, max(info_w_cache, info_w_needed))
-                    info_box, info_w = build_box(info_plain, info, info_w_cache)
-                    lines.extend(info_box)
+                    if max_info_rows <= 0:
+                        info_plain = []
+                        info = []
+                    elif len(info_plain) > max_info_rows:
+                        info_plain = info_plain[:max_info_rows]
+                        info = info[:max_info_rows]
+                    if info_plain:
+                        info_w_needed = max([len(line) for line in info_plain] + [0])
+                        info_w_cache = min(info_max_width, max(info_w_cache, info_w_needed))
+                        info_box, info_w = build_box(info_plain, info, info_w_cache)
+                        lines.extend(info_box)
 
-                # Help overlay panel
-                if (not ultra_compact) and show_help:
+                # Help overlay panel (skip if space is tight to keep spectrum visible)
+                render_help = show_help and (not compact_info)
+                rows_after_info = len(lines)
+                if term_rows - rows_after_info - min_spectrum_rows - 1 <= 0:
+                    render_help = False
+                if (not ultra_compact) and render_help:
                     help_sink = current_output_sink or get_default_sink() or "(unknown)"
                     help_lines = [
                         "Help",
@@ -1521,8 +1554,12 @@ def main():
                     lines.append(c(help_border, "2"))
 
                 # History / up-next panels (responsive)
-                show_history = (not tiny_term) and (not ultra_compact)
-                show_up_next = (not (tiny_term or small_term)) and (not ultra_compact)
+                show_history = (not tiny_term) and (not ultra_compact) and (not compact_info)
+                show_up_next = (not (tiny_term or small_term)) and (not ultra_compact) and (not compact_info)
+                rows_budget = term_rows - len(lines) - min_spectrum_rows - 1
+                if rows_budget <= 0:
+                    show_history = False
+                    show_up_next = False
                 panel_max_width = info_max_width
                 if show_history and show_up_next:
                     panel_max_width = max(10, (term_cols - 10) // 2)
@@ -1849,6 +1886,7 @@ def main():
         teardown_private_sink(private_module, loopback_module)
         enable_autowrap()
         show_cursor()
+        exit_alt_screen()
 
 if __name__ == "__main__":
     main()
