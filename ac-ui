@@ -1,0 +1,1854 @@
+#!/usr/bin/env python3
+import os, sys, time, random, subprocess, json, select, termios, tty, signal, threading, shutil, re, queue, textwrap
+from collections import deque
+
+MUSIC_DIR = os.path.expanduser("~/.local/share/ac-terminal-radio/music")
+MPV = "mpv"
+
+# Weighting: piano gets +77% relative weight => 1.77x.
+# We'll implement by adding 1 extra "ticket" for piano (simple and close to your earlier request).
+PIANO_EXTRA_TICKETS = 1  # each piano track appears twice in the pool
+
+# Spectrum analyzer settings
+CAVA_HEIGHT = 8
+CAVA_MAX = 1000
+CAVA_MIN_BARS = 24
+CAVA_MARGIN = 4
+RESIZE_DEBOUNCE = 0.25
+LOOPBACK_SYNC_INTERVAL = 1.0
+HISTORY_MAX = 6
+QUEUE_SIZE = 5
+UP_NEXT_MAX = 3
+
+try:
+    REFRESH_INTERVAL = float(os.environ.get("AC_UI_REFRESH", "0.033"))
+except Exception:
+    REFRESH_INTERVAL = 0.033
+
+try:
+    IDLE_REFRESH = float(os.environ.get("AC_UI_IDLE_REFRESH", "0.10"))
+except Exception:
+    IDLE_REFRESH = 0.10
+
+PRIVATE_SINK = os.environ.get("AC_UI_PRIVATE_SINK", "1").lower() in ("1", "true", "yes")
+OUTPUT_SINK = os.environ.get("AC_UI_OUTPUT_SINK", "").strip()
+if OUTPUT_SINK.lower() in ("default", "@default@", "@default_sink@"):
+    OUTPUT_SINK = ""
+AUDIO_DEVICE_OVERRIDE = os.environ.get("AC_UI_AUDIO_DEVICE", "").strip()
+
+
+MUTE_MODE = os.environ.get("AC_UI_MUTE_MODE", "hard").lower()
+try:
+    SOFT_MUTE_VOL = int(os.environ.get("AC_UI_SOFT_MUTE_VOL", "1"))
+except Exception:
+    SOFT_MUTE_VOL = 1
+
+# Simple ANSI colors (disable with NO_COLOR env var)
+USE_COLOR = os.environ.get("NO_COLOR") is None
+def c(text, code):
+    if not USE_COLOR:
+        return text
+    return f"[{code}m{text}[0m"
+
+def c256(text, code):
+    if not USE_COLOR:
+        return text
+    return f"[38;5;{code}m{text}[0m"
+
+def strip_ansi(s):
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+def visible_len(s):
+    return len(strip_ansi(s))
+
+def drop_first_visible(s):
+    if not s:
+        return s
+    if not USE_COLOR:
+        return s[1:]
+    # remove the first colorized char (e.g., \x1b[38;5;245m+\x1b[0m)
+    return re.sub(r"^\x1b\[[0-9;]*m.\x1b\[0m", "", s, count=1)
+
+TITLE_ART = []
+TITLE_ART_COLORED = False
+TITLE_ART_BASE = []
+TITLE_LOLCAT_PATH = None
+SHOW_TITLE_ART = os.environ.get("AC_UI_TITLE_ART", "1").lower() not in ("0", "false", "no")
+DEBUG_ART = os.environ.get("AC_UI_DEBUG_ART", "0").lower() in ("1", "true", "yes")
+GRADIENT_ANIMATE = os.environ.get("AC_UI_GRADIENT_ANIM", "1").lower() not in ("0", "false", "no")
+try:
+    GRADIENT_SPEED = float(os.environ.get("AC_UI_GRADIENT_SPEED", "0.02"))
+except Exception:
+    GRADIENT_SPEED = 0.02
+BOX_GRADIENT_PHASE = 0.0
+BOX_BORDER_SPIN = os.environ.get("AC_UI_BORDER_SPIN", "1").lower() not in ("0", "false", "no")
+try:
+    BOX_BORDER_SPEED = float(os.environ.get("AC_UI_BORDER_SPEED", "0.5"))
+except Exception:
+    BOX_BORDER_SPEED = 0.5
+try:
+    BOX_BORDER_HILITE_LEN = int(os.environ.get("AC_UI_BORDER_HILITE_LEN", "10"))
+except Exception:
+    BOX_BORDER_HILITE_LEN = 10
+BOX_BORDER_POS = 0
+TITLE_ANIMATE = os.environ.get("AC_UI_TITLE_ANIM", "1").lower() in ("1", "true", "yes")
+try:
+    TITLE_ANIM_FPS = float(os.environ.get("AC_UI_TITLE_FPS", "1.0"))
+except Exception:
+    TITLE_ANIM_FPS = 1.0
+
+VIS_MODE = os.environ.get("AC_UI_VIS", "bars").strip().lower()
+if VIS_MODE not in ("bars", "spectrum"):
+    VIS_MODE = "bars"
+VIS_MODES = ("bars", "spectrum")
+
+CHIME_DIR = os.path.join(MUSIC_DIR, "chimes")
+DEFAULT_HOUR_CHIME_NAME = "wild-world-town-tune.wav"
+DEFAULT_HOUR_CHIME = os.path.join(CHIME_DIR, DEFAULT_HOUR_CHIME_NAME)
+SOURCE_HOUR_CHIME = "/home/jfitz/Documents/Animal Crossing ) [x1FWild World： Town Tune (Defaultu0jiqLfo].wav"
+
+HOUR_CHIME_PATH = os.path.expanduser(os.environ.get("AC_UI_HOUR_CHIME", DEFAULT_HOUR_CHIME))
+if os.environ.get("AC_UI_HOUR_CHIME") is None:
+    # Auto-import the default chime into the app folder if present.
+    if not os.path.exists(HOUR_CHIME_PATH) and os.path.exists(SOURCE_HOUR_CHIME):
+        try:
+            os.makedirs(CHIME_DIR, exist_ok=True)
+            shutil.copy2(SOURCE_HOUR_CHIME, HOUR_CHIME_PATH)
+        except Exception:
+            pass
+if not os.path.exists(HOUR_CHIME_PATH):
+    HOUR_CHIME_PATH = None
+
+try:
+    CROSSFADE_SECONDS = float(os.environ.get("AC_UI_CROSSFADE", "3.5"))
+except Exception:
+    CROSSFADE_SECONDS = 3.5
+
+FILENAME_RE = re.compile(r"^(?P<hour>[01]\d|2[0-3])-(?P<game>[A-Z0-9]+)-(?P<variant>[a-z0-9_-]+)\.(?P<ext>mp3|flac)$")
+
+def parse_cli_args(argv):
+    mode = "run"
+    games = None
+    import_paths = []
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-h", "--help"):
+            print("Usage:")
+            print("  ac-ui [--games GCN,WW]")
+            print("  ac-ui import <files...>")
+            sys.exit(0)
+        if arg == "import":
+            mode = "import"
+            import_paths = argv[i + 1:]
+            break
+        if arg.startswith("--games="):
+            games = arg.split("=", 1)[1]
+        elif arg == "--games" and i + 1 < len(argv):
+            games = argv[i + 1]
+            i += 1
+        i += 1
+    if games:
+        games = {g.strip().upper() for g in games.split(",") if g.strip()}
+    return mode, games, import_paths
+
+def parse_filename(name):
+    m = FILENAME_RE.match(name)
+    if not m:
+        return None
+    return m.groupdict()
+
+def collect_catalog():
+    games = set()
+    variants = set()
+    if not os.path.isdir(MUSIC_DIR):
+        return games, variants
+    for hour in range(24):
+        d = hh_folder(hour)
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            meta = parse_filename(name)
+            if not meta:
+                continue
+            games.add(meta["game"])
+            variants.add(meta["variant"])
+    return games, variants
+
+def prompt_rename(msg):
+    try:
+        return input(msg).strip()
+    except EOFError:
+        return ""
+
+def import_files(paths):
+    if not paths:
+        print("No files specified for import.")
+        return 1
+    errors = 0
+    for src in paths:
+        src = os.path.expanduser(src)
+        if not os.path.isfile(src):
+            print(f"Missing file: {src}")
+            errors += 1
+            continue
+        name = os.path.basename(src)
+        meta = parse_filename(name)
+        while meta is None:
+            new_name = prompt_rename(
+                f"Invalid filename '{name}'. Enter new filename (HH-GAME-variant.ext) or blank to skip: "
+            )
+            if not new_name:
+                print(f"Skipped: {name}")
+                errors += 1
+                break
+            name = new_name
+            meta = parse_filename(name)
+        if meta is None:
+            continue
+        dest_dir = hh_folder(int(meta["hour"]))
+        os.makedirs(dest_dir, exist_ok=True)
+        dest_path = os.path.join(dest_dir, name)
+        while os.path.exists(dest_path):
+            new_name = prompt_rename(
+                f"File exists '{dest_path}'. Enter new filename to import or blank to skip: "
+            )
+            if not new_name:
+                print(f"Skipped: {name}")
+                errors += 1
+                break
+            meta = parse_filename(new_name)
+            if not meta:
+                print("Name does not match strict pattern HH-GAME-variant.ext")
+                errors += 1
+                continue
+            dest_dir = hh_folder(int(meta["hour"]))
+            os.makedirs(dest_dir, exist_ok=True)
+            dest_path = os.path.join(dest_dir, new_name)
+        if os.path.exists(dest_path):
+            continue
+        try:
+            shutil.copy2(src, dest_path)
+            print(f"Imported -> {dest_path}")
+        except Exception as e:
+            print(f"Failed to import {src}: {e}")
+            errors += 1
+    return 1 if errors else 0
+
+def hh_folder(hour: int) -> str:
+    return os.path.join(MUSIC_DIR, f"{hour:02d}")
+
+def list_tracks_for_hour(hour: int, allowed_games=None, allowed_variants=None):
+    d = hh_folder(hour)
+    if not os.path.isdir(d):
+        return []
+    tracks = []
+    for name in os.listdir(d):
+        lower = name.lower()
+        if lower.endswith(".mp3") or lower.endswith(".flac"):
+            if allowed_games:
+                meta = parse_filename(name)
+                if not meta or meta["game"] not in allowed_games:
+                    continue
+            if allowed_variants:
+                meta = parse_filename(name)
+                if not meta or meta["variant"] not in allowed_variants:
+                    continue
+            tracks.append(os.path.join(d, name))
+    tracks.sort()
+    return tracks
+
+def pick_weighted(tracks):
+    if not tracks:
+        return None
+    pool = []
+    for t in tracks:
+        pool.append(t)
+        # piano boost
+        if "piano" in os.path.basename(t).lower():
+            for _ in range(PIANO_EXTRA_TICKETS):
+                pool.append(t)
+    return random.choice(pool)
+
+def next_hour_epoch(now=None):
+    if now is None:
+        now = time.time()
+    lt = time.localtime(now)
+    # next top of hour
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, 59, 59, lt.tm_wday, lt.tm_yday, lt.tm_isdst)) + 1
+
+def fmt_mmss(seconds: float) -> str:
+    if seconds is None or seconds < 0:
+        return "--:--"
+    seconds = int(seconds)
+    m = seconds // 60
+    s = seconds % 60
+    return f"{m:02d}:{s:02d}"
+
+def spectrum_color(i, n):
+    if n <= 1:
+        return 81
+    return int(27 + (196 - 27) * (i / (n - 1)))
+
+def spectrum_lines(bars, height=CAVA_HEIGHT, use_color=None, mode="bars", trail_bars=None, peak_bars=None):
+    if use_color is None:
+        use_color = USE_COLOR
+    bars = bars or []
+    n = len(bars)
+    if n == 0:
+        return ["(no spectrum data)"]
+    lines = ["" for _ in range(height)]
+    if mode == "circle":
+        center = (height - 1) / 2.0
+        rmax = center
+        base_r = rmax * 0.6
+        for i, val in enumerate(bars):
+            v = max(0.0, min(1.0, val))
+            color = spectrum_color(i, n) if use_color else None
+            angle = (i / max(1, n)) * (2.0 * 3.1415926)
+            # base ring
+            y_base = int(round(center - (base_r * __import__("math").sin(angle))))
+            # dynamic ring
+            dyn_r = base_r + v * (rmax - base_r)
+            y_dyn = int(round(center - (dyn_r * __import__("math").sin(angle))))
+            for row in range(height):
+                ch = " "
+                if row == y_base:
+                    ch = "."
+                if row == y_dyn:
+                    ch = "o"
+                if use_color and ch != " ":
+                    lines[row] += f"\x1b[38;5;{color}m{ch}\x1b[0m"
+                else:
+                    lines[row] += ch
+        return lines
+
+    for i, val in enumerate(bars):
+        v = max(0.0, min(1.0, val))
+        color = spectrum_color(i, n) if use_color else None
+        if mode == "wave":
+            center = (height - 1) / 2.0
+            y = int(round(center - (v * center)))
+            y_trail = None
+            if trail_bars is not None:
+                tv = max(0.0, min(1.0, trail_bars[i]))
+                y_trail = int(round(center - (tv * center)))
+            for row in range(height):
+                # Draw a small vertical ribbon from center to the wave point
+                if row == y:
+                    ch = "*"
+                elif y_trail is not None and row == y_trail:
+                    ch = "+"
+                elif (row > y and row <= center) or (row < y and row >= center):
+                    ch = "|"
+                else:
+                    ch = " "
+                if use_color and ch != " ":
+                    lines[row] += f"[38;5;{color}m{ch}[0m"
+                else:
+                    lines[row] += ch
+        elif mode == "spectrum":
+            pv = v
+            if peak_bars is not None:
+                pv = max(0.0, min(1.0, peak_bars[i]))
+            peak = (height - 1) - int(pv * (height - 1) + 0.5)
+            for row in range(height):
+                # Peak + faint fill for depth
+                if row == peak:
+                    ch = "#"
+                elif row > peak:
+                    ch = "."
+                else:
+                    ch = " "
+                if use_color and ch != " ":
+                    lines[row] += f"[38;5;{color}m{ch}[0m"
+                else:
+                    lines[row] += ch
+        else:
+            fill = int(v * height + 0.5)
+            for row in range(height):
+                filled = (height - row) <= fill
+                ch = "#" if filled else " "
+                if use_color:
+                    lines[row] += f"[38;5;{color}m{ch}[0m"
+                else:
+                    lines[row] += ch
+    return lines
+
+def wrap_plain(text, width):
+    if width <= 0:
+        return [text]
+    return textwrap.wrap(text, width=width, break_long_words=True, replace_whitespace=False)
+
+def build_box(lines_plain, lines_color, maxw_override=None):
+    if maxw_override is not None:
+        maxw = maxw_override
+    else:
+        maxw = max([len(line) for line in lines_plain] + [0])
+    inner_w = maxw + 2
+    width = inner_w + 2
+    height = len(lines_plain) + 2
+    perimeter = (2 * width) + (2 * (height - 2))
+    base_gray = 16
+    hilite = 255
+
+    def border_color(idx):
+        if not BOX_BORDER_SPIN or perimeter <= 0:
+            return base_gray
+        pos = BOX_BORDER_POS % max(1, perimeter)
+        span = max(1, BOX_BORDER_HILITE_LEN)
+        if ((idx - pos) % perimeter) < span:
+            return hilite
+        return base_gray
+
+    def border_index(row, col):
+        # Counter-clockwise: left edge (top->bottom), bottom (left->right),
+        # right edge (bottom->top), top (right->left)
+        if col == 0 and row <= height - 1:
+            return row
+        if row == height - 1:
+            return (height - 1) + col
+        if col == width - 1:
+            return (height - 1) + (width - 1) + (height - 1 - row)
+        return (height - 1) + (width - 1) + (height - 1) + (width - 1 - col)
+
+    # Top border
+    top = []
+    for col, ch in enumerate("+" + ("-" * inner_w) + "+"):
+        idx = border_index(0, col)
+        top.append(c256(ch, border_color(idx)))
+    out = ["".join(top)]
+
+    # Middle lines
+    right_start = width
+    for row, (plain, line) in enumerate(zip(lines_plain, lines_color)):
+        pad = " " * (maxw - len(plain))
+        left_idx = border_index(row + 1, 0)
+        right_idx = border_index(row + 1, width - 1)
+        left_border = c256("|", border_color(left_idx))
+        right_border = c256("|", border_color(right_idx))
+        if "\x1b[" in line:
+            out.append(left_border + " " + line + pad + " " + right_border)
+        else:
+            out.append(left_border + " " + line + pad + " " + right_border)
+
+    # Bottom border
+    bottom = []
+    for col, ch in enumerate("+" + ("-" * inner_w) + "+"):
+        idx = border_index(height - 1, col)
+        bottom.append(c256(ch, border_color(idx)))
+    out.append("".join(bottom))
+    return out, maxw
+
+def pad_box_lines(box_lines, width, target_len):
+    if len(box_lines) >= target_len:
+        return box_lines
+    pad_line = c256(f"| {' ' * width} |", 16)
+    # insert before bottom border
+    insert_at = max(1, len(box_lines) - 1)
+    while len(box_lines) < target_len:
+        box_lines.insert(insert_at, pad_line)
+    return box_lines
+
+def cava_config_text(bars, input_method=None, input_source=None):
+    input_block = ""
+    if input_method or input_source:
+        input_block = "[input]\n"
+        if input_method:
+            input_block += f"method = {input_method}\n"
+        if input_source:
+            input_block += f"source = {input_source}\n"
+        input_block += "\n"
+    return (
+        "[general]\n"
+        f"bars = {bars}\n\n"
+        + input_block +
+        "[output]\n"
+        "method = raw\n"
+        "raw_target = /dev/stdout\n"
+        "data_format = ascii\n"
+        f"ascii_max_range = {CAVA_MAX}\n"
+        "bar_delimiter = 59\n"
+        "frame_delimiter = 10\n"
+    )
+
+def calc_cava_bars():
+    cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+    bars = max(CAVA_MIN_BARS, cols - CAVA_MARGIN)
+    return bars
+
+
+
+def pactl(*args):
+    # Suppress pactl stderr to avoid noisy "Failure: No such entity"
+    try:
+        res = subprocess.run(["pactl", *args], text=True, capture_output=True)
+        return res.stdout if res.stdout is not None else ""
+    except Exception:
+        return ""
+
+def get_default_sink():
+    try:
+        out = pactl("info")
+        for line in out.splitlines():
+            if line.startswith("Default Sink:"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        return None
+    return None
+
+def find_loopback_input_ids(loopback_module_id, sink_name):
+    if not loopback_module_id and not sink_name:
+        return []
+    try:
+        out = pactl("list", "sink-inputs")
+    except Exception:
+        return []
+    current_id = None
+    module_id = None
+    source = None
+    media_name = None
+    app_name = None
+    matches = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Sink Input #"):
+            current_id = line.split("#", 1)[1].strip()
+            module_id = None
+            source = None
+            media_name = None
+            app_name = None
+        elif line.startswith("Module:") or line.startswith("Owner Module:"):
+            module_id = line.split(":", 1)[1].strip()
+        elif line.startswith("Source:"):
+            source = line.split(":", 1)[1].strip()
+        elif line.startswith("media.name ="):
+            media_name = line.split("=", 1)[1].strip().strip('"')
+        elif line.startswith("application.name ="):
+            app_name = line.split("=", 1)[1].strip().strip('"')
+        if not current_id:
+            continue
+        if loopback_module_id and module_id == str(loopback_module_id):
+            matches.append(current_id)
+        elif sink_name and source == f"{sink_name}.monitor":
+            matches.append(current_id)
+        elif media_name and "loopback" in media_name.lower():
+            matches.append(current_id)
+        elif app_name and "loopback" in app_name.lower():
+            matches.append(current_id)
+    return list(dict.fromkeys(matches))
+
+def set_loopback_volume(loopback_module_id, sink_name, vol_percent):
+    input_ids = find_loopback_input_ids(loopback_module_id, sink_name)
+    if not input_ids:
+        return False
+    ok = False
+    for input_id in input_ids:
+        try:
+            pactl("set-sink-input-volume", input_id, f"{vol_percent}%")
+            ok = True
+        except Exception:
+            pass
+    return ok
+
+def set_loopback_mute(loopback_module_id, sink_name, mute_on):
+    input_ids = find_loopback_input_ids(loopback_module_id, sink_name)
+    if not input_ids:
+        return False
+    ok = False
+    for input_id in input_ids:
+        try:
+            pactl("set-sink-input-mute", input_id, "1" if mute_on else "0")
+            # also force volume to 0 on mute for stubborn backends
+            if mute_on:
+                pactl("set-sink-input-volume", input_id, "0%")
+            ok = True
+        except Exception:
+            pass
+    return ok
+
+def list_sinks():
+    if not shutil.which("pactl"):
+        return []
+    try:
+        out = pactl("list", "short", "sinks")
+    except Exception:
+        return []
+    sinks = []
+    for line in out.splitlines():
+        cols = line.split("\t")
+        if len(cols) > 1:
+            sinks.append(cols[1].strip())
+    return [s for s in sinks if s]
+
+def reload_loopback(loopback_module_id, sink_name, target_sink):
+    if not shutil.which("pactl"):
+        return loopback_module_id, None
+    if not target_sink:
+        target_sink = get_default_sink()
+    if not target_sink:
+        return loopback_module_id, None
+    if loopback_module_id:
+        try:
+            pactl("unload-module", loopback_module_id)
+        except Exception:
+            pass
+    try:
+        new_id = pactl(
+            "load-module",
+            "module-loopback",
+            f"source={sink_name}.monitor",
+            f"sink={target_sink}",
+            "latency_msec=50",
+        ).strip()
+    except Exception:
+        new_id = None
+    return new_id or loopback_module_id, target_sink
+
+def setup_private_sink(output_sink=None):
+    if not shutil.which("pactl"):
+        return None, None, None, None
+    sink_name = "acui"
+    null_module_id = None
+    loopback_module_id = None
+    default_sink = get_default_sink()
+    target_sink = output_sink if output_sink else default_sink
+    try:
+        out = pactl("list", "short", "sinks")
+        for line in out.splitlines():
+            cols = line.split("\t")
+            if len(cols) > 1 and cols[1] == sink_name:
+                # already exists
+                break
+        else:
+            null_module_id = pactl(
+                "load-module",
+                "module-null-sink",
+                f"sink_name={sink_name}",
+                "sink_properties=device.description=AC_UI",
+            ).strip()
+    except Exception:
+        return None, None, None, None
+
+    if target_sink:
+        try:
+            loopback_module_id = pactl(
+                "load-module",
+                "module-loopback",
+                f"source={sink_name}.monitor",
+                f"sink={target_sink}",
+                "latency_msec=50",
+            ).strip()
+        except Exception:
+            loopback_module_id = None
+
+    return sink_name, null_module_id, loopback_module_id, target_sink
+
+def teardown_private_sink(null_module_id, loopback_module_id):
+    if loopback_module_id:
+        try:
+            pactl("unload-module", loopback_module_id)
+        except Exception:
+            pass
+    if null_module_id:
+        try:
+            pactl("unload-module", null_module_id)
+        except Exception:
+            pass
+
+def detect_cava_input():
+    env_method = os.environ.get("AC_UI_CAVA_INPUT")
+    env_source = os.environ.get("AC_UI_CAVA_SOURCE")
+    if env_method or env_source:
+        return env_method, env_source, "env"
+
+    # Prefer PulseAudio compat when pactl is available (works with PipeWire too)
+    method = "pulse" if shutil.which("pactl") else None
+    source = None
+    if method and shutil.which("pactl"):
+        try:
+            out = subprocess.check_output(["pactl", "info"], text=True)
+            for line in out.splitlines():
+                if line.startswith("Default Sink:"):
+                    sink = line.split(":", 1)[1].strip()
+                    if sink:
+                        source = f"{sink}.monitor"
+                    break
+        except Exception:
+            pass
+        if not source:
+            source = "@DEFAULT_MONITOR@"
+    return method, source, "auto"
+
+class RawMode:
+    def __enter__(self):
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+    def __exit__(self, *args):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+def mpv_start(track, ipc_path, audio_device=None, volume=None):
+    # Start mpv with IPC server so we can query time-pos/duration, and quit on demand.
+    # --no-video avoids cover art display.
+    cmd = [
+        MPV,
+        "--no-video",
+        "--quiet",
+        "--loop-file=inf",
+        f"--input-ipc-server={ipc_path}",
+    ]
+    if audio_device:
+        cmd.append(f"--audio-device={audio_device}")
+    if volume is not None:
+        cmd.append(f"--volume={int(max(0, min(100, volume)))}")
+    cmd.append(track)
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def mpv_ipc(ipc_path, command_dict):
+    # Send JSON command to mpv IPC; return response dict (or None)
+    try:
+        with open(ipc_path, "w") as f:
+            f.write(json.dumps(command_dict) + "\n")
+        # mpv replies on the same socket only if you use a real unix socket bidirectional.
+        # Writing-only is enough for "set_property"/"quit". For querying, we open as read/write via socket.
+        return None
+    except Exception:
+        return None
+
+def mpv_command(ipc_path, command):
+    # Send a command via unix socket (best-effort)
+    import socket
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.2)
+        s.connect(ipc_path)
+        s.sendall((json.dumps({"command": command}) + "\n").encode("utf-8"))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+def mpv_query(ipc_path, prop):
+    # Query via unix socket using python's socket module (reliable)
+    import socket
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.2)
+        s.connect(ipc_path)
+        s.sendall((json.dumps({"command": ["get_property", prop]}) + "\n").encode("utf-8"))
+        data = s.recv(4096).decode("utf-8", errors="ignore")
+        s.close()
+        # mpv can return multiple JSON lines; parse last valid line
+        lines = [ln for ln in data.splitlines() if ln.strip().startswith("{")]
+        for ln in reversed(lines):
+            try:
+                obj = json.loads(ln)
+                if obj.get("error") == "success":
+                    return obj.get("data")
+            except Exception:
+                pass
+        return None
+    except Exception:
+        return None
+
+
+
+def hide_cursor():
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+
+def show_cursor():
+    sys.stdout.write("\033[?25h")
+    sys.stdout.flush()
+
+def disable_autowrap():
+    sys.stdout.write("\033[?7l")
+    sys.stdout.flush()
+
+def enable_autowrap():
+    sys.stdout.write("\033[?7h")
+    sys.stdout.flush()
+
+def get_mute_volume():
+    return SOFT_MUTE_VOL if MUTE_MODE == "soft" else 0
+
+
+def play_chime(audio_device=None):
+    if not HOUR_CHIME_PATH:
+        return
+    if not os.path.exists(HOUR_CHIME_PATH):
+        return
+    cmd = [
+        MPV,
+        "--no-video",
+        "--quiet",
+        "--no-terminal",
+    ]
+    if audio_device:
+        cmd.append(f"--audio-device={audio_device}")
+    cmd.append(HOUR_CHIME_PATH)
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def render(lines):
+    # Minimize flicker by reusing the screen and only clearing to end of line.
+    size = shutil.get_terminal_size(fallback=(80, 24))
+    width = size.columns
+    height = size.lines
+    sys.stdout.write("\033[H")
+    # Ensure we never write more than the screen height
+    if len(lines) < height:
+        lines = lines + [""] * (height - len(lines))
+    elif len(lines) > height:
+        lines = lines[:height]
+    for idx, line in enumerate(lines):
+        # Avoid auto-wrap at terminal width (visible chars only)
+        if visible_len(line) >= width:
+            line = truncate_ansi_visible(line, max(0, width - 1))
+        sys.stdout.write(line + "\033[K")
+        if idx < height - 1:
+            sys.stdout.write("\n")
+    sys.stdout.write("\033[J")
+    sys.stdout.flush()
+
+def truncate_plain(s, maxlen):
+    if maxlen <= 0:
+        return ""
+    if len(s) <= maxlen:
+        return s
+    if maxlen <= 1:
+        return s[:maxlen]
+    return s[: maxlen - 3] + "..." if maxlen >= 3 else s[:maxlen]
+
+def truncate_ansi_visible(s, maxlen):
+    if maxlen <= 0:
+        return ""
+    out = []
+    visible = 0
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\x1b" and i + 1 < len(s) and s[i + 1] == "[":
+            # copy ANSI escape without counting visible width
+            end = i + 2
+            while end < len(s) and s[end] != "m":
+                end += 1
+            end = min(end + 1, len(s))
+            out.append(s[i:end])
+            i = end
+            continue
+        if visible >= maxlen:
+            break
+        out.append(ch)
+        visible += 1
+        i += 1
+    if visible >= maxlen:
+        out.append("\x1b[0m")
+    return "".join(out)
+
+def build_title_art(text, width):
+    if not SHOW_TITLE_ART:
+        return [], False, [], None
+    if shutil.which("figlet") is None:
+        return [], False, [], None
+    try:
+        art = subprocess.check_output(
+            ["figlet", "-w", str(max(10, width)), text],
+            text=True,
+        )
+        base_lines = [ln.rstrip("\n") for ln in art.splitlines()]
+        lines = list(base_lines)
+        lolcat_path = shutil.which("lolcat")
+        if lolcat_path is None:
+            for candidate in ("/usr/games/lolcat", "/usr/bin/lolcat", "/bin/lolcat"):
+                if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+                    lolcat_path = candidate
+                    break
+        if USE_COLOR and lolcat_path is not None:
+            try:
+                colored = subprocess.check_output(
+                    [lolcat_path, "-f"],
+                    input="\n".join(base_lines),
+                    text=True,
+                )
+                lines = [ln.rstrip("\n") for ln in colored.splitlines()]
+                return lines, True, base_lines, lolcat_path
+            except Exception:
+                return lines, False, base_lines, lolcat_path
+        return lines, False, base_lines, lolcat_path
+    except Exception:
+        return [], False, [], None
+
+
+def main():
+    global TITLE_ART_COLORED, TITLE_ART_BASE, TITLE_LOLCAT_PATH, BOX_GRADIENT_PHASE, BOX_BORDER_POS
+    mode, allowed_games, import_paths = parse_cli_args(sys.argv)
+    if mode == "import":
+        sys.exit(import_files(import_paths))
+    # basic checks
+    if not os.path.isdir(MUSIC_DIR):
+        print(f"Missing music dir: {MUSIC_DIR}")
+        sys.exit(1)
+
+    if not sys.stdin.isatty():
+        print("ac-ui needs to run in a real TTY. Try running it directly in your terminal.")
+        sys.exit(1)
+
+    # IPC socket path
+    ipc_base = f"/tmp/ac-mpv-{os.getuid()}"
+    ipc_a = f"{ipc_base}.a.sock"
+    ipc_b = f"{ipc_base}.b.sock"
+    current_ipc = ipc_a
+
+    mpv_proc = None
+    current_track = None
+    current_track_hour = None
+    last_hour = None
+    cava_lock = threading.Lock()
+    cava_bars = None
+    cava_ok = False
+    cava_proc = None
+    cava_thread = None
+    cava_err = None
+    cava_bars_count = None
+    resize_pending = False
+    last_resize_ts = 0.0
+    last_term_cols = None
+    last_term_rows = None
+    layout_mode = "normal"
+    info_w_cache = 0
+
+    last_query_ts = 0.0
+    mpv_query_interval = 0.5
+    cached_tpos = None
+    cached_dur = None
+    cached_vol = None
+
+    last_render_key = None
+    last_render_ts = 0.0
+    last_lines = None
+    last_loopback_ts = 0.0
+    last_loopback_vol = None
+    last_loopback_muted = None
+    term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+    art_lines, art_colored, art_base, lolcat_path = build_title_art("AC-UI", term_cols)
+    TITLE_ART[:] = art_lines
+    global TITLE_ART_COLORED
+    TITLE_ART_COLORED = art_colored
+    global TITLE_ART_BASE
+    TITLE_ART_BASE = art_base
+    global TITLE_LOLCAT_PATH
+    TITLE_LOLCAT_PATH = lolcat_path
+    if DEBUG_ART:
+        has_ansi = any("\x1b[" in ln for ln in TITLE_ART)
+        sys.stderr.write(
+            f"AC_UI_DEBUG_ART: show={SHOW_TITLE_ART} color={USE_COLOR} colored={TITLE_ART_COLORED} "
+            f"figlet={shutil.which('figlet')} lolcat={shutil.which('lolcat')} ansi={has_ansi}\n"
+        )
+    bars_len_cached = None
+    bars_len_cols = term_cols
+    bars_len_count = None
+    last_mute_toggle_ts = 0.0
+    last_key = ""
+    last_key_ts = 0.0
+    vis_idx = VIS_MODES.index(VIS_MODE)
+    smooth_bars = None
+    peak_bars = None
+    trail_bars = None
+    last_title_anim_ts = 0.0
+
+    muted = False
+    mute_prev_vol = 50
+    fade = None
+    transition = None
+    chime_proc = None
+    showing_chime = False
+    show_help = False
+    history = deque(maxlen=HISTORY_MAX)
+    next_candidates = []
+    next_candidates_ts = 0.0
+    next_candidates_key = None
+
+    catalog_games, catalog_variants = collect_catalog()
+    games_list = ["ALL"] + sorted(catalog_games)
+    variants_list = ["ALL"] + sorted(catalog_variants)
+    game_idx = 0
+    variant_idx = 0
+    cava_method, cava_source, cava_detect_mode = detect_cava_input()
+    private_sink = None
+    private_module = None
+    loopback_module = None
+    audio_device = None
+    output_vol = 75
+    loopback_q = None
+    current_output_sink = None
+    # Optional explicit mpv audio device (overrides private sink setup)
+    if AUDIO_DEVICE_OVERRIDE:
+        audio_device = AUDIO_DEVICE_OVERRIDE
+    elif PRIVATE_SINK:
+        target_sink = OUTPUT_SINK if OUTPUT_SINK else None
+        private_sink, private_module, loopback_module, _out_sink = setup_private_sink(target_sink)
+        current_output_sink = _out_sink
+        if private_sink:
+            cava_method = "pulse"
+            cava_source = f"{private_sink}.monitor"
+            cava_detect_mode = "private"
+            audio_device = f"pulse/{private_sink}"
+            if loopback_module:
+                set_loopback_volume(loopback_module, private_sink, output_vol)
+                loopback_q = queue.Queue()
+
+                def loopback_worker():
+                    while True:
+                        try:
+                            kind, val = loopback_q.get()
+                        except Exception:
+                            continue
+                        if kind == "mute":
+                            set_loopback_mute(loopback_module, private_sink, val)
+                        elif kind == "volume":
+                            set_loopback_volume(loopback_module, private_sink, val)
+
+                threading.Thread(target=loopback_worker, daemon=True).start()
+    else:
+        # If user specified a sink and we're not using a private sink, point mpv at it.
+        if OUTPUT_SINK:
+            audio_device = f"pulse/{OUTPUT_SINK}"
+            cava_method = "pulse"
+            cava_source = f"{OUTPUT_SINK}.monitor"
+            cava_detect_mode = "output-sink"
+
+    def stop_mpv_proc(proc, ipc_path):
+        # Try polite quit
+        if ipc_path and os.path.exists(ipc_path):
+            try:
+                mpv_ipc(ipc_path, {"command": ["quit"]})
+            except Exception:
+                pass
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=0.5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        # remove stale socket
+        try:
+            if ipc_path and os.path.exists(ipc_path):
+                os.remove(ipc_path)
+        except Exception:
+            pass
+
+    def stop_mpv():
+        nonlocal mpv_proc, fade, transition, chime_proc, showing_chime
+        if fade:
+            stop_mpv_proc(fade.get("old_proc"), fade.get("old_ipc"))
+            fade = None
+        if transition:
+            if transition.get("old_proc"):
+                stop_mpv_proc(transition.get("old_proc"), transition.get("old_ipc"))
+            if transition.get("new_proc"):
+                stop_mpv_proc(transition.get("new_proc"), transition.get("new_ipc"))
+            transition = None
+        if chime_proc and chime_proc.poll() is None:
+            try:
+                chime_proc.terminate()
+            except Exception:
+                pass
+        chime_proc = None
+        showing_chime = False
+        stop_mpv_proc(mpv_proc, current_ipc)
+        mpv_proc = None
+        # clean up any other stale socket
+        for path in (ipc_a, ipc_b):
+            try:
+                if path != current_ipc and os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+    def start_cava():
+        nonlocal cava_proc, cava_thread, cava_err, cava_ok, cava_bars, cava_bars_count
+        if cava_proc is not None:
+            return True
+        if shutil.which("cava") is None:
+            cava_err = "cava not installed"
+            return False
+        conf_path = f"/tmp/ac-cava-{os.getuid()}.conf"
+        bars_count = calc_cava_bars()
+        cava_bars_count = bars_count
+        try:
+            with open(conf_path, "w") as f:
+                f.write(cava_config_text(bars_count, cava_method, cava_source))
+        except Exception as e:
+            cava_err = f"config error: {e}"
+            return False
+        try:
+            cava_proc = subprocess.Popen(
+                ["cava", "-p", conf_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as e:
+            cava_err = f"start error: {e}"
+            return False
+
+        def reader():
+            nonlocal cava_bars, cava_ok
+            if cava_proc is None or cava_proc.stdout is None:
+                return
+            for line in cava_proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(";")
+                vals = []
+                for p in parts:
+                    try:
+                        vals.append(int(p))
+                    except Exception:
+                        pass
+                if not vals:
+                    continue
+                if len(vals) < bars_count:
+                    vals.extend([0] * (bars_count - len(vals)))
+                if len(vals) > bars_count:
+                    vals = vals[:bars_count]
+                bars = [min(1.0, v / CAVA_MAX) for v in vals]
+                with cava_lock:
+                    cava_bars = bars
+                    cava_ok = True
+
+        cava_thread = threading.Thread(target=reader, daemon=True)
+        cava_thread.start()
+        return True
+
+    def stop_cava():
+        nonlocal cava_proc, cava_bars, cava_ok, cava_err
+        if cava_proc is not None:
+            try:
+                cava_proc.terminate()
+            except Exception:
+                pass
+            cava_proc = None
+        cava_bars = None
+        cava_ok = False
+        cava_err = None
+
+    def start_for_hour(hour, crossfade=False):
+        nonlocal mpv_proc, current_track, current_track_hour, current_ipc, fade
+        active_games = None if game_idx == 0 else {games_list[game_idx]}
+        active_variants = None if variant_idx == 0 else {variants_list[variant_idx]}
+        tracks = list_tracks_for_hour(hour, active_games, active_variants)
+        track = pick_weighted(tracks)
+        if not track:
+            current_track = None
+            current_track_hour = None
+            return False
+        # If a fade is already in progress, stop the old track now
+        if fade:
+            stop_mpv_proc(fade.get("old_proc"), fade.get("old_ipc"))
+            fade = None
+
+        if crossfade and CROSSFADE_SECONDS > 0 and mpv_proc and mpv_proc.poll() is None:
+            next_ipc = ipc_b if current_ipc == ipc_a else ipc_a
+            # clear any stale socket
+            try:
+                if os.path.exists(next_ipc):
+                    os.remove(next_ipc)
+            except Exception:
+                pass
+            new_proc = mpv_start(track, next_ipc, audio_device, volume=0)
+            # wait for socket
+            for _ in range(30):
+                if os.path.exists(next_ipc):
+                    break
+                time.sleep(0.02)
+            fade = {
+                "old_proc": mpv_proc,
+                "old_ipc": current_ipc,
+                "new_proc": new_proc,
+                "new_ipc": next_ipc,
+                "start_ts": time.time(),
+                "dur": CROSSFADE_SECONDS,
+            }
+            current_track = track
+            current_track_hour = hour
+            update_history(track)
+            mpv_proc = new_proc
+            current_ipc = next_ipc
+            return True
+
+        stop_mpv()
+        current_track = track
+        current_track_hour = hour
+        update_history(track)
+        mpv_proc = mpv_start(track, current_ipc, audio_device)
+        # Give mpv a moment to create the socket
+        for _ in range(30):
+            if os.path.exists(current_ipc):
+                break
+            time.sleep(0.02)
+        # apply default volume to mpv if not using private sink loopback
+        if not (PRIVATE_SINK and loopback_module):
+            set_output_volume(output_vol)
+        if muted:
+            set_output_volume(get_mute_volume())
+        return True
+
+    def start_track_for_hour(hour, volume=None):
+        nonlocal current_track, current_track_hour, current_ipc
+        active_games = None if game_idx == 0 else {games_list[game_idx]}
+        active_variants = None if variant_idx == 0 else {variants_list[variant_idx]}
+        tracks = list_tracks_for_hour(hour, active_games, active_variants)
+        track = pick_weighted(tracks)
+        if not track:
+            return None, None, None
+        next_ipc = ipc_b if current_ipc == ipc_a else ipc_a
+        try:
+            if os.path.exists(next_ipc):
+                os.remove(next_ipc)
+        except Exception:
+            pass
+        proc = mpv_start(track, next_ipc, audio_device, volume=volume)
+        for _ in range(30):
+            if os.path.exists(next_ipc):
+                break
+            time.sleep(0.02)
+        current_track = track
+        current_track_hour = hour
+        current_ipc = next_ipc
+        return proc, next_ipc, track
+
+    def update_history(track_path):
+        if not track_path:
+            return
+        name = os.path.basename(track_path)
+        if history and history[-1] == name:
+            return
+        history.append(name)
+
+    def compute_next_candidates(hour, active_games, active_variants):
+        tracks = list_tracks_for_hour(hour, active_games, active_variants)
+        if current_track in tracks:
+            tracks = [t for t in tracks if t != current_track]
+        if not tracks:
+            return []
+        if len(tracks) <= QUEUE_SIZE:
+            return [os.path.basename(t) for t in tracks]
+        return [os.path.basename(t) for t in random.sample(tracks, QUEUE_SIZE)]
+
+
+    def set_volume(vol, ipc_path=None):
+        # Clamp volume and set explicitly to avoid drift
+        try:
+            v = int(max(0, min(100, vol)))
+            mpv_command(ipc_path or current_ipc, ["set_property", "volume", v])
+            return v
+        except Exception:
+            return None
+
+
+    def set_output_volume(vol):
+        nonlocal output_vol
+        try:
+            v = int(max(0, min(100, vol)))
+        except Exception:
+            v = 0
+        if PRIVATE_SINK and loopback_module:
+            if set_loopback_volume(loopback_module, private_sink, v):
+                output_vol = v
+                return v
+            return None
+        # fallback to mpv volume
+        v2 = set_volume(v)
+        if v2 is not None:
+            output_vol = v2
+        return v2
+
+    def sync_loopback_state():
+        nonlocal last_loopback_ts, last_loopback_vol, last_loopback_muted
+        if not (PRIVATE_SINK and loopback_module and private_sink):
+            return
+        now = time.time()
+        state_changed = (last_loopback_vol != output_vol) or (last_loopback_muted != muted)
+        if not state_changed:
+            return
+        last_loopback_ts = now
+        # Apply mute/unmute to loopback when sink-input appears
+        if loopback_q is not None:
+            if MUTE_MODE == "hard":
+                loopback_q.put(("mute", muted))
+            loopback_q.put(("volume", output_vol))
+        last_loopback_vol = output_vol
+        last_loopback_muted = muted
+
+    def handle_exit(signum=None, frame=None):
+        stop_cava()
+        stop_mpv()
+        teardown_private_sink(private_module, loopback_module)
+        show_cursor()
+        sys.stdout.write("[2J[H")
+        sys.stdout.flush()
+        sys.exit(0)
+
+    def get_playback():
+        nonlocal last_query_ts, cached_tpos, cached_dur, cached_vol
+        if transition or fade:
+            return cached_tpos, cached_dur, cached_vol
+        now = time.time()
+        if now - last_query_ts > mpv_query_interval:
+            cached_tpos = mpv_query(current_ipc, "time-pos") if current_track else None
+            cached_dur = mpv_query(current_ipc, "duration") if current_track else None
+            cached_vol = mpv_query(current_ipc, "volume") if current_track else None
+            last_query_ts = now
+        return cached_tpos, cached_dur, cached_vol
+
+    def start_hour_transition(next_hour, simulate=False):
+        nonlocal transition
+        if not (mpv_proc and mpv_proc.poll() is None):
+            # No current track; just play chime and fade in next
+            transition = {
+                "phase": "chime",
+                "next_hour": next_hour,
+                "start_ts": time.time(),
+                "simulate": simulate,
+            }
+            return
+        transition = {
+            "phase": "fade_out",
+            "old_proc": mpv_proc,
+            "old_ipc": current_ipc,
+            "next_hour": next_hour,
+            "start_ts": time.time(),
+            "dur": max(0.1, CROSSFADE_SECONDS),
+            "simulate": simulate,
+        }
+
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+
+    def handle_resize(signum=None, frame=None):
+        nonlocal resize_pending, last_resize_ts
+        resize_pending = True
+        last_resize_ts = time.time()
+
+    signal.signal(signal.SIGWINCH, handle_resize)
+
+    start_cava()
+
+    hide_cursor()
+    disable_autowrap()
+    try:
+        with RawMode():
+            while True:
+                now = time.time()
+                hour = int(time.strftime("%H", time.localtime(now)))
+                if GRADIENT_ANIMATE:
+                    BOX_GRADIENT_PHASE = (now * GRADIENT_SPEED) % 1.0
+                if BOX_BORDER_SPIN:
+                    BOX_BORDER_POS = int(now * BOX_BORDER_SPEED)
+                if TITLE_ANIMATE and TITLE_ART_BASE and TITLE_LOLCAT_PATH:
+                    interval = 1.0 / max(1.0, TITLE_ANIM_FPS)
+                    if now - last_title_anim_ts >= interval:
+                        try:
+                            seed = int(now * TITLE_ANIM_FPS)
+                            colored = subprocess.check_output(
+                                [TITLE_LOLCAT_PATH, "-f", "-S", str(seed)],
+                                input="\n".join(TITLE_ART_BASE),
+                                text=True,
+                            )
+                            TITLE_ART[:] = [ln.rstrip("\n") for ln in colored.splitlines()]
+                            TITLE_ART_COLORED = True
+                            last_title_anim_ts = now
+                        except Exception:
+                            pass
+                term_size = shutil.get_terminal_size(fallback=(80, 24))
+                term_cols = term_size.columns
+                term_rows = term_size.lines
+                if term_cols != last_term_cols or term_rows != last_term_rows:
+                    last_term_cols = term_cols
+                    last_term_rows = term_rows
+                    info_w_cache = 0
+                    # Hysteresis to avoid layout flapping near thresholds
+                    if layout_mode == "tiny":
+                        if term_cols >= 62 and term_rows >= 22:
+                            layout_mode = "small" if (term_cols < 82 or term_rows < 26) else "normal"
+                    elif layout_mode == "small":
+                        if term_cols < 58 or term_rows < 18:
+                            layout_mode = "tiny"
+                        elif term_cols >= 82 and term_rows >= 26:
+                            layout_mode = "normal"
+                    else:
+                        if term_cols < 58 or term_rows < 18:
+                            layout_mode = "tiny"
+                        elif term_cols < 78 or term_rows < 22:
+                            layout_mode = "small"
+
+                # Responsive layout for small terminals
+                tiny_term = layout_mode == "tiny"
+                small_term = layout_mode in ("tiny", "small")
+                ultra_compact = term_cols < 70 or term_rows < 18
+                # Keep box borders under terminal width to prevent auto-wrap
+                info_max_width = max(10, term_cols - 5)
+                spectrum_use_color = USE_COLOR
+                spectrum_height = 3 if ultra_compact else 4 if tiny_term else 6 if small_term else CAVA_HEIGHT
+
+                hour_changed = (last_hour is not None and hour != last_hour)
+                needs_start = (last_hour is None or mpv_proc is None or (mpv_proc and mpv_proc.poll() is not None))
+                if hour_changed and transition is None:
+                    start_hour_transition(hour, simulate=False)
+                if needs_start and transition is None:
+                    start_for_hour(hour, crossfade=False)
+                    last_hour = hour
+
+                # UI stats
+                if resize_pending and (now - last_resize_ts) >= RESIZE_DEBOUNCE:
+                    resize_pending = False
+                    stop_cava()
+                    start_cava()
+                    bars_len_cached = None
+                    bars_len_cols = term_cols
+                    bars_len_count = None
+
+                nh = next_hour_epoch(now)
+                remaining = max(0, int(nh - now))
+
+                # Query mpv playback (best-effort, cached)
+                tpos, dur, vol = get_playback()
+
+                # Render UI without full-screen clear to reduce flicker
+                lines = []
+                info = []
+                info_plain = []
+                def add_info_line(text, color_code="2"):
+                    text = truncate_plain(text, info_max_width)
+                    info_plain.append(text)
+                    info.append(c(text, color_code))
+
+                tline = f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                if ultra_compact:
+                    # Smallest layout: only show system time + visualizer
+                    lines.append(c(tline, "2"))
+                if (not ultra_compact) and TITLE_ART:
+                    if TITLE_ART_COLORED:
+                        info.extend([line for line in TITLE_ART])
+                        info_plain.extend([strip_ansi(line) for line in TITLE_ART])
+                    else:
+                        info.extend([c(line, "38;5;77") for line in TITLE_ART])
+                        info_plain.extend([line for line in TITLE_ART])
+                    controls_plain = "Controls: [n] next track   [q] quit   [s] audio output   [?] help / more controls   [+/-] volume"
+                    if tiny_term:
+                        controls_plain = "Keys: n next  q quit  s audio output  ? help / more  +/- vol"
+                    # Wrap controls to fit the terminal width so the info box doesn't overflow
+                    max_controls_width = max(20, term_cols - 6)
+                    controls_wrapped = wrap_plain(controls_plain, max_controls_width)
+                    for line in controls_wrapped:
+                        add_info_line(line, "33")
+                    add_info_line("", "2")
+                    add_info_line(tline, "2")
+                    fline = f"Filter: Game={games_list[game_idx]}  Variant={variants_list[variant_idx]}"
+                    add_info_line(fline, "2")
+                    vline = f"Visualizer: {VIS_MODES[vis_idx]}"
+                    add_info_line(vline, "2")
+                    if showing_chime and HOUR_CHIME_PATH:
+                        line1_plain = "Hour folder: --    Now playing: (hour chime)"
+                        add_info_line(line1_plain, "36")
+                    elif current_track:
+                        display_hour = current_track_hour if current_track_hour is not None else hour
+                        line1_plain = f"Hour folder: {display_hour:02d}    Now playing: {os.path.basename(current_track)}"
+                        add_info_line(line1_plain, "36")
+                        line2_plain = f"Playback: {fmt_mmss(tpos or -1)} / {fmt_mmss(dur or -1)}"
+                        add_info_line(line2_plain, "35")
+                        display_vol = output_vol if (PRIVATE_SINK and loopback_module) else (int(vol) if vol is not None else None)
+                        if display_vol is not None:
+                            vline = f"Volume: {int(display_vol):3d}%"
+                            add_info_line(vline, "33")
+                        mline = f"Mute: {'ON' if muted else 'OFF'}"
+                        add_info_line(mline, "33")
+                    else:
+                        line1_plain = f"Hour folder: {hour:02d}    Now playing: (none found)"
+                        add_info_line(line1_plain, "36")
+                    add_info_line("", "2")
+                    ulabel = "Until next hour:"
+                    uvalue = f"{remaining//60:02d}:{remaining%60:02d}"
+                    uline = f"{ulabel} {uvalue}"
+                    add_info_line(uline, "95")
+
+                # Refresh "next candidates" at most once per second or on filter/hour change
+                active_games = None if game_idx == 0 else {games_list[game_idx]}
+                active_variants = None if variant_idx == 0 else {variants_list[variant_idx]}
+                cand_key = (hour, tuple(sorted(active_games)) if active_games else ("ALL",),
+                            tuple(sorted(active_variants)) if active_variants else ("ALL",))
+                if now - next_candidates_ts > 1.0 or cand_key != next_candidates_key:
+                    next_candidates = compute_next_candidates(hour, active_games, active_variants)
+                    next_candidates_ts = now
+                    next_candidates_key = cand_key
+
+                if not ultra_compact:
+                    # Box the info section (width based on plain text)
+                    info_w_needed = max([len(line) for line in info_plain] + [0])
+                    info_w_cache = min(info_max_width, max(info_w_cache, info_w_needed))
+                    info_box, info_w = build_box(info_plain, info, info_w_cache)
+                    lines.extend(info_box)
+
+                # Help overlay panel
+                if (not ultra_compact) and show_help:
+                    help_sink = current_output_sink or get_default_sink() or "(unknown)"
+                    help_lines = [
+                        "Help",
+                        "n: next track   m: mute   q: quit",
+                        "g: cycle game   v: cycle variant",
+                        "h: simulate hour change   t: vis mode   s: audio output",
+                        "+/-: volume     ?: toggle help",
+                        f"Audio output: {help_sink}",
+                    ]
+                    help_w = max(len(s) for s in help_lines)
+                    help_border = "+" + ("-" * (help_w + 2)) + "+"
+                    lines.append(c(help_border, "2"))
+                    for s in help_lines:
+                        pad = " " * (help_w - len(s))
+                        lines.append(c(f"| {s}{pad} |", "2"))
+                    lines.append(c(help_border, "2"))
+
+                # History / up-next panels (responsive)
+                show_history = (not tiny_term) and (not ultra_compact)
+                show_up_next = (not (tiny_term or small_term)) and (not ultra_compact)
+                panel_max_width = info_max_width
+                if show_history and show_up_next:
+                    panel_max_width = max(10, (term_cols - 10) // 2)
+
+                hist_box = None
+                up_box = None
+                if show_history:
+                    hist_title = "Recently played"
+                    hist_title_trunc = truncate_plain(hist_title, info_max_width)
+                    hist_list = list(history)[-HISTORY_MAX:]
+                    hist_lines = [hist_title_trunc] + (hist_list if hist_list else ["(none yet)"])
+                    hist_lines = [truncate_plain(s, panel_max_width) for s in hist_lines]
+                    hist_plain = hist_lines
+                    hist_color = [c(hist_title_trunc, "36")] + [c(s, "2") for s in hist_lines[1:]]
+                    hist_box, hist_w = build_box(hist_plain, hist_color)
+
+                if show_up_next:
+                    if next_candidates:
+                        shown = list(next_candidates[:UP_NEXT_MAX])
+                        if len(next_candidates) > UP_NEXT_MAX:
+                            shown.append(f"... +{len(next_candidates) - UP_NEXT_MAX} more")
+                        header_plain = f"Up next ({min(len(next_candidates), UP_NEXT_MAX)}/{len(next_candidates)})"
+                        header_plain_trunc = truncate_plain(header_plain, info_max_width)
+                        up_plain = [header_plain_trunc] + shown
+                        up_plain = [truncate_plain(s, panel_max_width) for s in up_plain]
+                        up_color = [c(header_plain_trunc, "36")] + [c(s, "2") for s in up_plain[1:]]
+                    else:
+                        up_title = "Up next"
+                        up_title_trunc = truncate_plain(up_title, info_max_width)
+                        up_plain = [up_title_trunc, "(no candidates)"]
+                        up_plain = [truncate_plain(s, panel_max_width) for s in up_plain]
+                        up_color = [c(up_title_trunc, "36"), c("(no candidates)", "2")]
+                    up_box, up_w = build_box(up_plain, up_color)
+
+                if hist_box and up_box:
+                    # side-by-side if they fit, otherwise stack
+                    total_w = (hist_w + 4) + (up_w + 4)
+                    if total_w <= term_cols:
+                        target_len = max(len(hist_box), len(up_box))
+                        hist_box = pad_box_lines(hist_box, hist_w, target_len)
+                        up_box = pad_box_lines(up_box, up_w, target_len)
+                        for left, right in zip(hist_box, up_box):
+                            lines.append(left + drop_first_visible(right))
+                    else:
+                        lines.extend(hist_box)
+                        lines.extend(up_box)
+                elif hist_box:
+                    lines.extend(hist_box)
+                elif up_box:
+                    lines.extend(up_box)
+
+                prefix = "  "
+                # Fit spectrum to remaining terminal rows to avoid overlap/flicker
+                rows_used = len(lines)
+                available_rows = max(0, term_rows - rows_used - 1)  # leave room for divider
+                spectrum_height_dyn = min(spectrum_height, max(0, available_rows))
+                with cava_lock:
+                    bars = list(cava_bars) if cava_bars else None
+                    ok = cava_ok
+                # Cache bars_len based on terminal width and cava bar count
+                if bars_len_cached is None or bars_len_cols != term_cols or bars_len_count != (cava_bars_count or 0):
+                    bars_len_cols = term_cols
+                    bars_len_count = cava_bars_count or 0
+                    max_len = max(CAVA_MIN_BARS, term_cols - CAVA_MARGIN)
+                    available = max(10, term_cols - len(prefix) - CAVA_MARGIN)
+                    bars_len = len(bars) if bars else (cava_bars_count or max_len)
+                    if bars_len > max_len:
+                        bars_len = max_len
+                    if bars_len > available:
+                        bars_len = available
+                    bars_len_cached = bars_len
+                else:
+                    bars_len = bars_len_cached
+                if spectrum_height_dyn > 0:
+                    if bars and bars_len is not None and len(bars) > bars_len:
+                        bars = bars[:bars_len]
+                    if bars:
+                        # Smooth + peak-hold for more dynamic motion
+                        if smooth_bars is None or len(smooth_bars) != len(bars):
+                            smooth_bars = list(bars)
+                            peak_bars = list(bars)
+                            trail_bars = list(bars)
+                        smoothed = []
+                        new_peaks = []
+                        new_trail = []
+                        for i, b in enumerate(bars):
+                            prev = smooth_bars[i]
+                            s = prev * 0.7 + b * 0.3
+                            smoothed.append(s)
+                            peak = peak_bars[i]
+                            peak = max(s, peak * 0.92)
+                            new_peaks.append(peak)
+                            trail = trail_bars[i]
+                            trail = max(s, trail * 0.85)
+                            new_trail.append(trail)
+                        smooth_bars = smoothed
+                        peak_bars = new_peaks
+                        trail_bars = new_trail
+
+                        draw_mode = VIS_MODES[vis_idx]
+                        if draw_mode == "spectrum":
+                            draw_bars = smooth_bars
+                        else:
+                            draw_bars = smooth_bars
+
+                        lines.extend([prefix + ln for ln in spectrum_lines(draw_bars, height=spectrum_height_dyn, use_color=spectrum_use_color, mode=draw_mode, trail_bars=trail_bars, peak_bars=peak_bars)])
+                    elif cava_err:
+                        lines.append(prefix + c(f"({cava_err})", "31"))
+                    elif ok:
+                        lines.append(prefix + c("(no data)", "33"))
+                    else:
+                        lines.append(prefix + c("(waiting for audio...)", "33"))
+                    lines.append(c(prefix + ("-" * bars_len), "34"))
+
+                # Handle crossfade volumes (non-blocking)
+                if fade:
+                    now_ts = time.time()
+                    elapsed = now_ts - fade["start_ts"]
+                    dur = max(0.05, fade["dur"])
+                    if PRIVATE_SINK and loopback_module:
+                        target = 100
+                    else:
+                        target = int(output_vol if output_vol is not None else 50)
+                    if muted:
+                        new_vol = get_mute_volume()
+                        old_vol = get_mute_volume()
+                    else:
+                        p = max(0.0, min(1.0, elapsed / dur))
+                        new_vol = int(target * p)
+                        old_vol = int(target * (1.0 - p))
+                    set_volume(new_vol, fade["new_ipc"])
+                    set_volume(old_vol, fade["old_ipc"])
+                    if elapsed >= dur:
+                        stop_mpv_proc(fade["old_proc"], fade["old_ipc"])
+                        fade = None
+
+                # Hour-change sequence: fade out -> chime -> fade in (non-blocking)
+                if transition:
+                    now_ts = time.time()
+                    phase = transition.get("phase")
+                    dur = max(0.1, transition.get("dur", CROSSFADE_SECONDS))
+                    if PRIVATE_SINK and loopback_module:
+                        target = 100
+                    else:
+                        target = int(output_vol if output_vol is not None else 50)
+                    if phase == "fade_out":
+                        p = max(0.0, min(1.0, (now_ts - transition["start_ts"]) / dur))
+                        vol = int(target * (1.0 - p)) if not muted else get_mute_volume()
+                        set_volume(vol, transition.get("old_ipc"))
+                        if p >= 1.0:
+                            stop_mpv_proc(transition.get("old_proc"), transition.get("old_ipc"))
+                            transition["old_proc"] = None
+                            transition["old_ipc"] = None
+                            mpv_proc = None
+                            # Reset current playback state while chime plays
+                            current_track = None
+                            current_track_hour = None
+                            showing_chime = True
+                            if HOUR_CHIME_PATH:
+                                try:
+                                    chime_proc = subprocess.Popen(
+                                        [MPV, "--no-video", "--quiet", "--no-terminal"] + ([f"--audio-device={audio_device}"] if audio_device else []) + [HOUR_CHIME_PATH],
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
+                                    )
+                                except Exception:
+                                    chime_proc = None
+                                transition["phase"] = "chime"
+                            else:
+                                transition["phase"] = "fade_in"
+                                transition["start_ts"] = time.time()
+                    elif phase == "chime":
+                        if chime_proc is None:
+                            if HOUR_CHIME_PATH:
+                                try:
+                                    chime_proc = subprocess.Popen(
+                                        [MPV, "--no-video", "--quiet", "--no-terminal"] + ([f"--audio-device={audio_device}"] if audio_device else []) + [HOUR_CHIME_PATH],
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
+                                    )
+                                except Exception:
+                                    chime_proc = None
+                            else:
+                                transition["phase"] = "fade_in"
+                                transition["start_ts"] = time.time()
+                        if chime_proc is None or chime_proc.poll() is not None:
+                            chime_proc = None
+                            showing_chime = False
+                            transition["phase"] = "fade_in"
+                            transition["start_ts"] = time.time()
+                    elif phase == "fade_in":
+                        if transition.get("new_proc") is None:
+                            new_proc, new_ipc, _track = start_track_for_hour(transition["next_hour"], volume=0)
+                            transition["new_proc"] = new_proc
+                            transition["new_ipc"] = new_ipc
+                        p = max(0.0, min(1.0, (now_ts - transition["start_ts"]) / dur))
+                        vol = int(target * p) if not muted else get_mute_volume()
+                        set_volume(vol, transition.get("new_ipc"))
+                        if p >= 1.0:
+                            # finalize: swap current proc to new proc
+                            mpv_proc = transition.get("new_proc")
+                            if not transition.get("simulate"):
+                                last_hour = transition.get("next_hour", last_hour)
+                            transition = None
+
+                # Keep loopback mute/volume in sync even if sink-input appears later
+                sync_loopback_state()
+                # Pad to fixed terminal height to prevent visual jitter
+                if len(lines) < term_rows:
+                    lines.extend([""] * (term_rows - len(lines)))
+                elif len(lines) > term_rows:
+                    lines = lines[:term_rows]
+
+                if lines != last_lines:
+                    render(lines)
+                    last_lines = list(lines)
+
+                # Non-blocking key read (fixed refresh rate)
+                fd = sys.stdin.fileno()
+                r, _, _ = select.select([fd], [], [], REFRESH_INTERVAL)
+                if r:
+                    try:
+                        ch = os.read(fd, 1).decode("utf-8", errors="ignore")
+                    except Exception:
+                        ch = ""
+                    # Track non-m keypresses to prevent auto-repeat toggling
+                    if ch.lower() == "q":
+                        handle_exit()
+                    if ch.lower() == "n":
+                        # skip: start another random track in same hour
+                        start_for_hour(hour, crossfade=False)
+                        next_candidates_ts = 0.0
+                    if ch.lower() == "h":
+                        # Simulate hour change: fade out -> chime -> fade in
+                        next_hour = (hour + 1) % 24
+                        if transition is None:
+                            start_hour_transition(next_hour, simulate=True)
+                    if ch.lower() == "g":
+                        game_idx = (game_idx + 1) % len(games_list)
+                        last_hour = None
+                        start_for_hour(hour, crossfade=False)
+                        next_candidates_ts = 0.0
+                    if ch.lower() == "v":
+                        variant_idx = (variant_idx + 1) % len(variants_list)
+                        last_hour = None
+                        start_for_hour(hour, crossfade=False)
+                        next_candidates_ts = 0.0
+                    if ch.lower() == "t":
+                        vis_idx = (vis_idx + 1) % len(VIS_MODES)
+                    if ch.lower() == "s":
+                        if PRIVATE_SINK and private_sink and shutil.which("pactl"):
+                            sinks = list_sinks()
+                            if sinks:
+                                if current_output_sink in sinks:
+                                    idx = (sinks.index(current_output_sink) + 1) % len(sinks)
+                                else:
+                                    idx = 0
+                                next_sink = sinks[idx]
+                                loopback_module, current_output_sink = reload_loopback(
+                                    loopback_module, private_sink, next_sink
+                                )
+                                if loopback_module:
+                                    set_loopback_volume(
+                                        loopback_module,
+                                        private_sink,
+                                        get_mute_volume() if muted else output_vol,
+                                    )
+                                    set_loopback_mute(loopback_module, private_sink, muted)
+                                last_loopback_ts = 0.0
+                    if ch == "-" :
+                        if PRIVATE_SINK and loopback_module:
+                            set_output_volume(output_vol - 5)
+                        else:
+                            mpv_command(ipc_path, ["add", "volume", -5])
+                    if ch == "+" or ch == "=":
+                        if PRIVATE_SINK and loopback_module:
+                            set_output_volume(output_vol + 5)
+                        else:
+                            mpv_command(ipc_path, ["add", "volume", 5])
+                    if ch.lower() == "m":
+                        # debounce + ignore auto-repeat bursts
+                        now_ts = time.time()
+                        if last_key == "m" and (now_ts - last_key_ts) < 0.4:
+                            continue
+                        if now_ts - last_mute_toggle_ts < 1.0:
+                            continue
+                        last_mute_toggle_ts = now_ts
+                        if muted:
+                            # Unmute: avoid blocking on pactl; sync loopback in main loop
+                            if PRIVATE_SINK and loopback_module:
+                                set_output_volume(mute_prev_vol if mute_prev_vol is not None else output_vol)
+                                new_vol = mute_prev_vol if mute_prev_vol is not None else output_vol
+                            else:
+                                new_vol = set_output_volume(mute_prev_vol if mute_prev_vol is not None else 50)
+                            muted = False
+                            last_loopback_ts = 0.0
+                            if new_vol is not None:
+                                cached_vol = new_vol
+                        else:
+                            if (PRIVATE_SINK and loopback_module and output_vol > 0):
+                                mute_prev_vol = output_vol
+                            elif cached_vol is not None and cached_vol > 0:
+                                mute_prev_vol = cached_vol
+                            # Mute: silence speakers via loopback, keep signal for visualizer
+                            if PRIVATE_SINK and loopback_module:
+                                # defer pactl to avoid stutter
+                                pass
+                            else:
+                                set_output_volume(get_mute_volume())
+                            muted = True
+                            last_loopback_ts = 0.0
+                            cached_vol = get_mute_volume()
+                        last_key = "m"
+                        last_key_ts = now_ts
+                        continue
+                    if ch == "?":
+                        show_help = not show_help
+                    if ch:
+                        last_key = ch.lower()
+                        last_key_ts = time.time()
+    finally:
+        stop_cava()
+        stop_mpv()
+        teardown_private_sink(private_module, loopback_module)
+        enable_autowrap()
+        show_cursor()
+
+if __name__ == "__main__":
+    main()
